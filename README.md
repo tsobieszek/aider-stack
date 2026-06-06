@@ -44,6 +44,6 @@ The installer configures a global safety hook script (`aider-stack-confirm.py`) 
 - `AI!` (DO): Claude makes the change; the file is marked for edit.
 - `AI?` (INLINE): Claude adds a reply comment tagged `AI?>` below the line.
 - `AI??` (ASK): Claude answers in chat; the file is not marked for edit.
-- `AI` (CONTEXT): Sent to Claude as information; the file is not marked for edit.
+- `AI` (CONTEXT): Sent to Claude as information; rides along only when some `AI!`/`AI?`/`AI??` marker exists somewhere. On its own it does nothing. The file is not marked for edit.
 
-`ai-watch` removes every marker token (only the token, not the line) from the file *before* dispatching, so Claude never sees or touches the markers and they cannot re-fire. `AI!`/`AI?` mark the file editable (`EDIT:`); `AI??`/`AI` do not (`FILE:`).
+On any change, `ai-watch` rescans all watched files and, if any actionable marker (`AI!`/`AI?`/`AI??`) exists anywhere, sends a **single** prompt with every marker from every file (a file containing only `AI` never triggers on its own). It removes every marker token (only the token, not the line) from each file *before* dispatching, so Claude never sees or touches the markers and they cannot re-fire. There is no cache: every save is re-evaluated. `AI!`/`AI?` mark a file editable (`EDIT:`); `AI??`/`AI` do not (`FILE:`).

@@ -18,6 +18,8 @@ WATCH_DIR="."
 EXT_RE='\.(py|pyi|jl|rs|go|js|mjs|cjs|jsx|ts|tsx|c|h|cc|cpp|cxx|hpp|hh|cs|java|kt|kts|scala|sc|sbt|flix|kk|clj|cljs|cljc|edn|scm|rkt|el|lisp|ml|mli|fs|fsi|fsx|hs|lhs|elm|ex|exs|erl|hrl|lua|rb|rake|php|swift|dart|zig|nim|cr|v|r|R|pl|pm|pp|groovy|gradle|sh|bash|zsh|fish|ps1|sql|vim|toml|yaml|yml|json|jsonc|json5|xml|html|htm|svg|vue|svelte|astro|css|scss|sass|less|tex|latex|sty|cls|bib|md|markdown|rst|adoc|org|proto|thrift|graphql|gql|tf|hcl|cmake|nix|cabal|purs|re|res)$'
 IGNORE_RE='(/\.git/|/node_modules/|/target/|/\.venv/|~$|\.sw[a-z]$|/4913$|\.tmp$|\.part$)'
 AI_EXCLUDE="${AI_EXCLUDE:-$IGNORE_RE}"   # POSIX ERE for inotify --exclude (paths never watched)
+ACTIONABLE_RE='(^|[^[:alnum:]_])AI[?!]+[[:space:]]*$'   # grep pre-filter: AI? AI?? AI!
+ANYMARK_RE='(^|[^[:alnum:]_])AI[?!]*[[:space:]]*$'      # grep pre-filter: any marker incl bare AI
 
 command -v file >/dev/null && HAVE_FILE=1 || HAVE_FILE=0
 
@@ -48,12 +50,16 @@ MARKERS (at end of line; markers mid-line, e.g. inside /* ... */, are ignored)
   AI!    DO      Claude makes the change (file marked EDIT:).
   AI?    INLINE  Claude adds a reply comment tagged  AI?>  below the line (EDIT:).
   AI??   ASK     Claude answers in the chat window; file not marked for edit.
-  AI     CONTEXT Sent as information; file not marked for edit.
+  AI     CONTEXT Sent as information; rides along only when some AI!/AI?/AI?? marker
+                 exists somewhere. On its own it does nothing. Not marked for edit.
 
-ai-watch removes every marker token (only the token, not the line) from the file
-BEFORE dispatching, so Claude never sees or touches the markers and they cannot
-re-fire. There is NO cache: every save is re-evaluated. DO/INLINE mark the file
-editable (EDIT:); ASK/CONTEXT do not (FILE:).
+On any change, ai-watch rescans all watched files; if any actionable marker
+(AI!/AI?/AI??) exists anywhere, it sends ONE prompt with every marker from every
+file. A file containing only AI (context) never triggers on its own. ai-watch
+removes every marker token (only the token, not the line) before dispatching, so
+Claude never sees or touches the markers and they cannot re-fire. There is NO cache:
+every save is re-evaluated. DO/INLINE mark a file editable (EDIT:); ASK/CONTEXT
+do not (FILE:).
 
 TARGETS
   Files with a recognised extension, plus extensionless files that `file` magic
@@ -191,23 +197,21 @@ strip_markers() {
     rm -f "$tmp"
 }
 
-# Dispatch the markers found in a file (no cache: every save re-evaluates).
-# ai-watch removes ALL marker tokens from the file before dispatching, so Claude
-# never sees or touches them and they cannot re-fire (only the token is removed,
-# not the line). DO/INLINE need code edits (EDIT:); ASK/CONTEXT do not (FILE:).
-process_file() {
-    local f="$1"
-    [[ -f "$f" ]]            || return
-    [[ "$f" =~ $IGNORE_RE ]] && return
-    is_target "$f"          || return
-    (( GIT_ONLY )) && git_ignored "$f" && return
+# Append "  - item" lines for the named array under a title (skipped when empty).
+section() {
+    local title="$1"; local -n _items="$2"
+    (( ${#_items[@]} )) || return
+    printf '\n%s\n' "$title"
+    local x; for x in "${_items[@]}"; do printf '  - %s\n' "$x"; done
+}
 
-    local out; out="$(detect_markers "$f")"
+# Print one file's section: an EDIT:/FILE: header plus its DO/INLINE/ASK/CONTEXT
+# items (block content shown with markers stripped). Nothing if it has no markers.
+file_section() {
+    local f="$1" out kind start end block range decoded indented bline item
+    out="$(detect_markers "$f")"
     [[ -z "$out" ]] && return
-
     local -a do_items=() ask_items=() inline_items=() context_items=()
-    local kind start end block range x decoded indented bline item
-
     while IFS="$SEP" read -r kind start end block; do
         [[ -z "$kind" ]] && continue
         [[ "$start" == "$end" ]] && range="line $start" || range="lines $start-$end"
@@ -222,36 +226,46 @@ process_file() {
             CONTEXT) context_items+=("$item");;
         esac
     done <<<"$out"
-
     (( ${#do_items[@]} + ${#ask_items[@]} + ${#inline_items[@]} + ${#context_items[@]} == 0 )) && return
 
-    # Remove every marker token from the file before sending (no cache, no re-fire).
-    (( DRY_RUN )) || strip_markers "$f"
+    (( ${#do_items[@]} + ${#inline_items[@]} )) && printf '\nEDIT: %s\n' "$f" || printf '\nFILE: %s\n' "$f"
+    section "DO — make the change described at:" do_items
+    section "INLINE — for each, insert a new comment line directly below the referenced line, using the file's comment syntax, of the exact form  AI?> <your reply> :" inline_items
+    section "ASK — answer here in chat. Leave the file unchanged:" ask_items
+    section "CONTEXT — for your information. Leave the file unchanged:" context_items
+}
 
-    local editable=0
-    (( ${#do_items[@]} + ${#inline_items[@]} )) && editable=1
+# Print every watched target file whose content matches RE (a fast grep pre-filter),
+# applying the same ignore/target/git filters as the dispatcher.
+files_with_markers() {
+    local re="$1" f
+    grep -rlIE --exclude-dir=.git --exclude-dir=node_modules \
+               --exclude-dir=.venv --exclude-dir=target "$re" "$WATCH_DIR" 2>/dev/null |
+    while IFS= read -r f; do
+        [[ -f "$f" ]]            || continue
+        [[ "$f" =~ $IGNORE_RE ]] && continue
+        is_target "$f"          || continue
+        (( GIT_ONLY )) && git_ignored "$f" && continue
+        printf '%s\n' "$f"
+    done
+}
 
-    local p="aider-stack: "$'\n'
-    (( editable )) && p+="EDIT: $f"$'\n' || p+="FILE: $f"$'\n'
-    p+="act on these AI markers."$'\n'
-    if (( ${#do_items[@]} )); then
-        p+=$'\n'"DO — make the change described at:"$'\n'
-        for x in "${do_items[@]}"; do p+="  - $x"$'\n'; done
-    fi
-    if (( ${#inline_items[@]} )); then
-        p+=$'\n'"INLINE — for each, insert a new comment line directly below the referenced line, using the file's comment syntax, of the exact form  AI?> <your reply> :"$'\n'
-        for x in "${inline_items[@]}"; do p+="  - $x"$'\n'; done
-    fi
-    if (( ${#ask_items[@]} )); then
-        p+=$'\n'"ASK — answer here in chat. Leave the file unchanged:"$'\n'
-        for x in "${ask_items[@]}"; do p+="  - $x"$'\n'; done
-    fi
-    if (( ${#context_items[@]} )); then
-        p+=$'\n'"CONTEXT — for your information. Leave the file unchanged:"$'\n'
-        for x in "${context_items[@]}"; do p+="  - $x"$'\n'; done
-    fi
+# Scan all watched files (no cache). Dispatch a SINGLE prompt with every marker from
+# every file ONLY if some actionable marker (AI!/AI?/AI??) exists somewhere; bare AI
+# alone does nothing. ai-watch strips all markers before sending, so Claude never sees
+# them and they cannot re-fire.
+scan_and_dispatch() {
+    files_with_markers "$ACTIONABLE_RE" | grep -q . || return   # nothing actionable
 
-    (( VERBOSE )) && log "dispatch -> $f"
+    local -a files=(); local f
+    mapfile -t files < <(files_with_markers "$ANYMARK_RE")
+    (( ${#files[@]} )) || return
+
+    local p; p="aider-stack: "$'\n'"act on these AI markers."$'\n'
+    for f in "${files[@]}"; do p+="$(file_section "$f")"$'\n'; done
+
+    (( VERBOSE )) && log "dispatch -> ${#files[@]} file(s)"
+    (( DRY_RUN )) || for f in "${files[@]}"; do strip_markers "$f"; done
     send_to_claude "$p"
 }
 
@@ -291,5 +305,5 @@ if [[ "${AI_LIB:-0}" != 1 ]]; then
     inotifywait -m -r -e close_write -e moved_to \
         --exclude "$AI_EXCLUDE" --format '%w%f' "$WATCH_DIR" \
         2> >(grep -vE 'Setting up watches|Watches established' >&2) |
-    while IFS= read -r path; do process_file "$path"; done
+    while IFS= read -r _; do scan_and_dispatch; done   # any event -> rescan all files
 fi
