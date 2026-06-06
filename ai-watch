@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# ai-watch — aider-style AI markers for Claude Code running in a kitty window.
+# Assumes X11 and that Claude is a split in the same kitty OS window as the watcher.
+# See `ai-watch --help` for usage.
+
+set -uo pipefail
+
+# ---- config (env overridable) ---------------------------------------------
+KITTY_WIN="${KITTY_WIN:-}"       # kitty window id Claude runs in (NOT the watcher's);
+                                 # from env or --kitty-win-id, else defaults to 1 below
+DRY_RUN="${AI_DRY_RUN:-0}"
+VERBOSE="${AI_VERBOSE:-0}"
+GIT_ONLY=0
+AI_NL="${AI_NL:-\\r}"            # body newline -> this (printf %b escapes); CR by default
+AI_ENTER_CMD="${AI_ENTER_CMD:-}" # if set, run this to submit instead of the built-in
+WATCH_DIR="."
+
+EXT_RE='\.(py|pyi|jl|rs|go|js|mjs|cjs|jsx|ts|tsx|c|h|cc|cpp|cxx|hpp|hh|cs|java|kt|kts|scala|sc|sbt|flix|kk|clj|cljs|cljc|edn|scm|rkt|el|lisp|ml|mli|fs|fsi|fsx|hs|lhs|elm|ex|exs|erl|hrl|lua|rb|rake|php|swift|dart|zig|nim|cr|v|r|R|pl|pm|pp|groovy|gradle|sh|bash|zsh|fish|ps1|sql|vim|toml|yaml|yml|json|jsonc|json5|xml|html|htm|svg|vue|svelte|astro|css|scss|sass|less|tex|latex|sty|cls|bib|md|markdown|rst|adoc|org|proto|thrift|graphql|gql|tf|hcl|cmake|nix|cabal|purs|re|res)$'
+IGNORE_RE='(/\.git/|/node_modules/|/target/|/\.venv/|~$|\.sw[a-z]$|/4913$|\.tmp$|\.part$)'
+AI_EXCLUDE="${AI_EXCLUDE:-$IGNORE_RE}"   # POSIX ERE for inotify --exclude (paths never watched)
+
+command -v file >/dev/null && HAVE_FILE=1 || HAVE_FILE=0
+
+SEP=$'\x1f'
+
+usage() {
+cat <<'EOF'
+ai-watch — watch files for aider-style AI markers and drive Claude Code.
+(X11; Claude must be a split in the same kitty OS window as the watcher.)
+
+USAGE
+  ai-watch [options] [DIR]
+
+ARGUMENTS
+  DIR                  Directory to watch (default: current directory).
+
+OPTIONS
+  --kitty-win-id ID    kitty window id where Claude Code runs (find it with
+                       `kitten @ ls`). Default: 1. Do NOT use the watcher's own
+                       window id ($KITTY_WINDOW_ID) — the prompt would go to the
+                       watcher instead of Claude.
+  --git-only           Only target files that are NOT gitignored. DIR must be a
+                       git work tree.
+  -v, --verbose        Log each dispatch.
+  -h, --help           Show this help.
+
+MARKERS (at end of line; markers mid-line, e.g. inside /* ... */, are ignored)
+  AI!    DO      Claude makes the change (file marked EDIT:).
+  AI?    INLINE  Claude adds a reply comment tagged  AI?>  below the line (EDIT:).
+  AI??   ASK     Claude answers in the chat window; file not marked for edit.
+  AI     CONTEXT Sent as information; file not marked for edit.
+
+ai-watch removes every marker token (only the token, not the line) from the file
+BEFORE dispatching, so Claude never sees or touches the markers and they cannot
+re-fire. There is NO cache: every save is re-evaluated. DO/INLINE mark the file
+editable (EDIT:); ASK/CONTEXT do not (FILE:).
+
+TARGETS
+  Files with a recognised extension, plus extensionless files that `file` magic
+  reports as text (shell scripts, PKGBUILD, configure, ...).
+
+SUBMITTING
+  The prompt body is typed via `kitten @ send-text` (newlines sent as AI_NL,
+  default CR). The Enter that submits is sent via:
+    kitten @ send-key --match id:<ID> enter   (requires kitty >= 0.36)
+  Set AI_ENTER_CMD to override the submit step entirely.
+
+ENVIRONMENT
+  KITTY_WIN        Same as --kitty-win-id (default 1).
+  AI_ENTER_CMD     Custom submit command, run verbatim. Overrides the built-in.
+  AI_NL            Byte(s) each body newline becomes (default: \r).
+  AI_EXCLUDE       POSIX ERE of paths inotify must NOT watch (default: built-in
+                   IGNORE_RE). Anchor components, e.g. (^|/)(\.[^/]+|build)(/|$).
+  AI_VERBOSE=1     Same as --verbose.
+  AI_DRY_RUN=1     Print the prompt to stderr instead of sending.
+
+EXAMPLES
+  ai-watch --kitty-win-id 3 ~/code/proj
+  ai-watch --git-only --kitty-win-id 3 -v .
+EOF
+}
+
+log() { printf '[ai-watch %(%H:%M:%S)T] %s\n' -1 "$*" >&2; }
+
+press_enter() {
+    if [[ -n "$AI_ENTER_CMD" ]]; then eval "$AI_ENTER_CMD"; return; fi
+    kitten @ send-key --match "id:$KITTY_WIN" enter 2>/dev/null \
+        || log "cannot submit Enter (need kitty>=0.36 send-key or AI_ENTER_CMD)"
+}
+
+send_to_claude() {
+    if [[ "$DRY_RUN" == 1 ]]; then
+        { printf '===PROMPT to kitty id:%s  (nl=%s)===\n%s\n===END===\n' \
+            "$KITTY_WIN" "$AI_NL" "$1"; } >&2
+        return
+    fi
+    local body="$1"
+    while [[ "$body" == *$'\n' ]]; do body="${body%$'\n'}"; done   # trim trailing newlines
+    {
+        local first=1 line
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            (( first )) || printf '%b' "$AI_NL"
+            printf '%s' "$line"
+            first=0
+        done <<<"$body"
+    } | kitten @ send-text --match "id:$KITTY_WIN" --stdin
+    press_enter
+}
+
+# Recognised extension, or extensionless text file (per `file` magic).
+is_target() {
+    local f="$1" base nodot enc
+    [[ "$f" =~ $EXT_RE ]] && return 0
+    base="${f##*/}"; nodot="${base#.}"     # drop one leading dot (dotfiles)
+    [[ "$nodot" == *.* ]] && return 1      # unrecognised extension -> skip
+    (( HAVE_FILE )) || return 1
+    enc="$(file --mime-encoding -b -- "$f" 2>/dev/null)"
+    [[ -n "$enc" && "$enc" != binary && "$enc" != cannot* && "$enc" != *error* ]]
+}
+
+git_ignored() { git -C "$WATCH_DIR" check-ignore -q -- "$1" 2>/dev/null; }
+
+# Output one record per blank-line-separated block that contains a marker.
+# Record format (fields separated by US=\x1f):
+#   kind US start_line US end_line US block_content
+# where block_content has lines joined by \x0c (form feed).
+# Markers must appear at end of line (optionally followed by whitespace).
+# Actionable markers (DO/ASK/INLINE) take priority over CONTEXT within a block.
+detect_markers() {
+    awk -v US="$(printf '\037')" '
+    function kind_of(L) {
+        if (L ~ /(^|[^[:alnum:]_])AI\?>[ \t]*$/)  return "REPLY"
+        if (L ~ /(^|[^[:alnum:]_])AI\?\?[ \t]*$/) return "ASK"
+        if (L ~ /(^|[^[:alnum:]_])AI\?[ \t]*$/)   return "INLINE"
+        if (L ~ /(^|[^[:alnum:]_])AI![ \t]*$/)    return "DO"
+        if (L ~ /(^|[^[:alnum:]_])AI[ \t]*$/)     return "CONTEXT"
+        return ""
+    }
+    { sub(/\r$/, ""); lines[NR] = $0 }   # tolerate CRLF: drop trailing CR
+    END {
+        n = NR; i = 1
+        while (i <= n) {
+            if (lines[i] ~ /^[ \t]*$/) { i++; continue }
+            bs = i
+            while (i <= n && lines[i] !~ /^[ \t]*$/) i++
+            be = i - 1
+            marker_kind = ""; marker_line = 0
+            for (j = bs; j <= be; j++) {
+                k = kind_of(lines[j])
+                if (k == "DO" || k == "ASK" || k == "INLINE") {
+                    marker_kind = k; marker_line = j; break
+                }
+            }
+            if (marker_kind == "") {
+                for (j = bs; j <= be; j++) {
+                    if (kind_of(lines[j]) == "CONTEXT") {
+                        marker_kind = "CONTEXT"; marker_line = j; break
+                    }
+                }
+            }
+            if (marker_kind == "") continue
+            block = lines[bs]
+            for (j = bs + 1; j <= be; j++) block = block "\014" lines[j]
+            print marker_kind US bs US be US block
+        }
+    }' "$1"
+}
+
+# Remove every trigger marker token (AI!/AI?/AI??/AI) at end of line, keeping the
+# rest of the line. An existing AI?> inline reply is left untouched. Reads stdin,
+# writes stdout. Order mirrors detect_markers' priority (REPLY/ASK/INLINE/DO/CONTEXT).
+strip_text() {
+    awk '
+    {
+        if      ($0 ~ /(^|[^[:alnum:]_])AI\?>[ \t]*$/) { }
+        else if ($0 ~ /(^|[^[:alnum:]_])AI\?\?[ \t]*$/) sub(/[ \t]*AI\?\?[ \t]*$/, "")
+        else if ($0 ~ /(^|[^[:alnum:]_])AI\?[ \t]*$/)   sub(/[ \t]*AI\?[ \t]*$/, "")
+        else if ($0 ~ /(^|[^[:alnum:]_])AI![ \t]*$/)    sub(/[ \t]*AI![ \t]*$/, "")
+        else if ($0 ~ /(^|[^[:alnum:]_])AI[ \t]*$/)     sub(/[ \t]*AI[ \t]*$/, "")
+        print
+    }'
+}
+
+# Strip all trigger markers from a file in place (mode/inode preserved). Done before
+# dispatching so Claude never sees the markers and they cannot re-fire (no cache).
+strip_markers() {
+    local f="$1" tmp
+    tmp="$(mktemp)" || return
+    strip_text < "$f" > "$tmp"
+    cmp -s "$f" "$tmp" || cat "$tmp" > "$f"
+    rm -f "$tmp"
+}
+
+# Dispatch the markers found in a file (no cache: every save re-evaluates).
+# ai-watch removes ALL marker tokens from the file before dispatching, so Claude
+# never sees or touches them and they cannot re-fire (only the token is removed,
+# not the line). DO/INLINE need code edits (EDIT:); ASK/CONTEXT do not (FILE:).
+process_file() {
+    local f="$1"
+    [[ -f "$f" ]]            || return
+    [[ "$f" =~ $IGNORE_RE ]] && return
+    is_target "$f"          || return
+    (( GIT_ONLY )) && git_ignored "$f" && return
+
+    local out; out="$(detect_markers "$f")"
+    [[ -z "$out" ]] && return
+
+    local -a do_items=() ask_items=() inline_items=() context_items=()
+    local kind start end block range x decoded indented bline item
+
+    while IFS="$SEP" read -r kind start end block; do
+        [[ -z "$kind" ]] && continue
+        [[ "$start" == "$end" ]] && range="line $start" || range="lines $start-$end"
+        decoded="$(strip_text <<<"${block//$'\x0c'/$'\n'}")"   # hide markers from Claude
+        indented=""
+        while IFS= read -r bline; do indented+="    $bline"$'\n'; done <<<"$decoded"
+        item="$range:"$'\n'"$indented"
+        case "$kind" in
+            DO)      do_items+=("$item");;
+            ASK)     ask_items+=("$item");;
+            INLINE)  inline_items+=("$item");;
+            CONTEXT) context_items+=("$item");;
+        esac
+    done <<<"$out"
+
+    (( ${#do_items[@]} + ${#ask_items[@]} + ${#inline_items[@]} + ${#context_items[@]} == 0 )) && return
+
+    # Remove every marker token from the file before sending (no cache, no re-fire).
+    (( DRY_RUN )) || strip_markers "$f"
+
+    local editable=0
+    (( ${#do_items[@]} + ${#inline_items[@]} )) && editable=1
+
+    local p="aider-stack: "$'\n'
+    (( editable )) && p+="EDIT: $f"$'\n' || p+="FILE: $f"$'\n'
+    p+="act on these AI markers."$'\n'
+    if (( ${#do_items[@]} )); then
+        p+=$'\n'"DO — make the change described at:"$'\n'
+        for x in "${do_items[@]}"; do p+="  - $x"$'\n'; done
+    fi
+    if (( ${#inline_items[@]} )); then
+        p+=$'\n'"INLINE — for each, insert a new comment line directly below the referenced line, using the file's comment syntax, of the exact form  AI?> <your reply> :"$'\n'
+        for x in "${inline_items[@]}"; do p+="  - $x"$'\n'; done
+    fi
+    if (( ${#ask_items[@]} )); then
+        p+=$'\n'"ASK — answer here in chat. Leave the file unchanged:"$'\n'
+        for x in "${ask_items[@]}"; do p+="  - $x"$'\n'; done
+    fi
+    if (( ${#context_items[@]} )); then
+        p+=$'\n'"CONTEXT — for your information. Leave the file unchanged:"$'\n'
+        for x in "${context_items[@]}"; do p+="  - $x"$'\n'; done
+    fi
+
+    (( VERBOSE )) && log "dispatch -> $f"
+    send_to_claude "$p"
+}
+
+# ---- main (skipped when sourced with AI_LIB=1 for tests) ------------------
+if [[ "${AI_LIB:-0}" != 1 ]]; then
+    while (( $# )); do
+        case "$1" in
+            --kitty-win-id) KITTY_WIN="${2:?--kitty-win-id needs an id}"; shift 2;;
+            --git-only)     GIT_ONLY=1; shift;;
+            -v|--verbose)   VERBOSE=1; shift;;
+            -h|--help)      usage; exit 0;;
+            --)             shift; break;;
+            -*)             echo "unknown option: $1" >&2; usage; exit 2;;
+            *)              WATCH_DIR="$1"; shift;;
+        esac
+    done
+    [[ $# -gt 0 ]] && WATCH_DIR="$1"
+
+    KITTY_WIN="${KITTY_WIN:-1}"   # fall back to id 1 only if neither option nor env set it
+
+    [[ -d "$WATCH_DIR" ]] || { echo "not a directory: $WATCH_DIR" >&2; exit 1; }
+    WATCH_DIR="$(cd "$WATCH_DIR" && pwd)"
+
+    if (( GIT_ONLY )); then
+        if ! command -v git >/dev/null; then
+            log "--git-only: git not found; disabling filter"; GIT_ONLY=0
+        elif ! git -C "$WATCH_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            log "--git-only: $WATCH_DIR is not a git work tree; disabling filter"; GIT_ONLY=0
+        fi
+    fi
+
+    command -v inotifywait >/dev/null || { echo "need inotify-tools" >&2; exit 1; }
+    extra=""; (( GIT_ONLY )) && extra=" (git-only)"
+    log "watching $WATCH_DIR -> kitty id:$KITTY_WIN$extra"
+    # --exclude keeps inotify from watching ignored trees (.git, node_modules, ...);
+    # real errors (e.g. watch-limit reached) stay visible, only the chatter is dropped.
+    inotifywait -m -r -e close_write -e moved_to \
+        --exclude "$AI_EXCLUDE" --format '%w%f' "$WATCH_DIR" \
+        2> >(grep -vE 'Setting up watches|Watches established' >&2) |
+    while IFS= read -r path; do process_file "$path"; done
+fi

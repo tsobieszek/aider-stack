@@ -1,0 +1,37 @@
+#!/bin/bash
+# ~/bin/ai-watch-toggle - Toggle ai-watch, targeting the currently focused (Claude) window.
+
+set -uo pipefail
+
+TITLE="ai-watch"
+PROGRAM="$HOME/bin/ai-watch"
+BG="#faf6ff"
+# Paths inotify must NOT watch (POSIX ERE, anchored to path components):
+# dotfiles/dirs, plus build/target/node_modules. Edit to taste.
+IGNORED='(^|/)(\.[^/]+|build|target|node_modules)(/|$)'
+
+# Id of the kitty window holding keyboard focus when the hotkey fired (= Claude's).
+focused_window_id() {
+    kitten @ ls | python3 -c '
+import json, sys
+wins = json.load(sys.stdin)
+ids = [w["id"] for o in wins for t in o["tabs"] for w in t["windows"] if w.get("is_focused")]
+print(ids[0] if ids else "")
+'
+}
+
+if kitten @ ls | grep -q "\"title\": *\"$TITLE\""; then
+    kitten @ close-window --match "title:^$TITLE$"
+else
+    # Explicit KITTY_WIN env wins; otherwise target the focused (Claude) window.
+    # If both are empty, ai-watch falls back to id 1 on its own.
+    winopt=()
+    claude_win="${KITTY_WIN:-$(focused_window_id)}"
+    [[ -n "$claude_win" ]] && winopt=(--kitty-win-id "$claude_win")
+    kitten @ launch --location first \
+        --title "$TITLE" \
+        --color background="$BG" \
+        --cwd current \
+        --env AI_EXCLUDE="$IGNORED" \
+        "$PROGRAM" ${winopt[@]+"${winopt[@]}"}
+fi
