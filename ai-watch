@@ -16,7 +16,7 @@ AI_ENTER_CMD="${AI_ENTER_CMD:-}" # if set, run this to submit instead of the bui
 WATCH_DIR="."
 
 EXT_RE='\.(py|pyi|jl|rs|go|js|mjs|cjs|jsx|ts|tsx|c|h|cc|cpp|cxx|hpp|hh|cs|java|kt|kts|scala|sc|sbt|flix|kk|clj|cljs|cljc|edn|scm|rkt|el|lisp|ml|mli|fs|fsi|fsx|hs|lhs|elm|ex|exs|erl|hrl|lua|rb|rake|php|swift|dart|zig|nim|cr|v|r|R|pl|pm|pp|groovy|gradle|sh|bash|zsh|fish|ps1|sql|vim|toml|yaml|yml|json|jsonc|json5|xml|html|htm|svg|vue|svelte|astro|css|scss|sass|less|tex|latex|sty|cls|bib|md|markdown|rst|adoc|org|proto|thrift|graphql|gql|tf|hcl|cmake|nix|cabal|purs|re|res)$'
-IGNORE_RE='(/\.git/|/node_modules/|/target/|/\.venv/|~$|\.sw[a-z]$|/4913$|\.tmp$|\.part$)'
+IGNORE_RE='(/\.git/|/node_modules/|/target/|/\.venv/|/\.aider|~$|\.sw[a-z]$|/4913$|\.tmp$|\.part$)'
 AI_EXCLUDE="${AI_EXCLUDE:-$IGNORE_RE}"   # POSIX ERE for inotify --exclude (paths never watched)
 ACTIONABLE_RE='(^|[^[:alnum:]_])AI[?!]+[[:space:]]*$'   # grep pre-filter: AI? AI?? AI!
 ANYMARK_RE='(^|[^[:alnum:]_])AI[?!]*[[:space:]]*$'      # grep pre-filter: any marker incl bare AI
@@ -236,15 +236,17 @@ file_section() {
 }
 
 # Print every watched target file whose content matches RE (a fast grep pre-filter),
-# applying the same ignore/target/git filters as the dispatcher.
+# applying the same ignore/target/git filters as the dispatcher. AI_EXCLUDE is the
+# same regex inotify uses, so the rescan never reads a path inotify wouldn't watch.
 files_with_markers() {
     local re="$1" f
     grep -rlIE --exclude-dir=.git --exclude-dir=node_modules \
                --exclude-dir=.venv --exclude-dir=target "$re" "$WATCH_DIR" 2>/dev/null |
     while IFS= read -r f; do
-        [[ -f "$f" ]]            || continue
-        [[ "$f" =~ $IGNORE_RE ]] && continue
-        is_target "$f"          || continue
+        [[ -f "$f" ]]             || continue
+        [[ "$f" =~ $IGNORE_RE ]]  && continue
+        [[ "$f" =~ $AI_EXCLUDE ]] && continue
+        is_target "$f"           || continue
         (( GIT_ONLY )) && git_ignored "$f" && continue
         printf '%s\n' "$f"
     done
@@ -255,11 +257,16 @@ files_with_markers() {
 # alone does nothing. ai-watch strips all markers before sending, so Claude never sees
 # them and they cannot re-fire.
 scan_and_dispatch() {
-    files_with_markers "$ACTIONABLE_RE" | grep -q . || return   # nothing actionable
-
     local -a files=(); local f
     mapfile -t files < <(files_with_markers "$ANYMARK_RE")
     (( ${#files[@]} )) || return
+
+    # Need at least one actionable marker (AI!/AI?/AI??) somewhere; bare AI alone does nothing.
+    local actionable=0
+    for f in "${files[@]}"; do
+        grep -qE "$ACTIONABLE_RE" "$f" 2>/dev/null && { actionable=1; break; }
+    done
+    (( actionable )) || return
 
     local p; p="aider-stack: "$'\n'"act on these AI markers."$'\n'
     for f in "${files[@]}"; do p+="$(file_section "$f")"$'\n'; done
@@ -305,5 +312,8 @@ if [[ "${AI_LIB:-0}" != 1 ]]; then
     inotifywait -m -r -e close_write -e moved_to \
         --exclude "$AI_EXCLUDE" --format '%w%f' "$WATCH_DIR" \
         2> >(grep -vE 'Setting up watches|Watches established' >&2) |
-    while IFS= read -r _; do scan_and_dispatch; done   # any event -> rescan all files
+    while IFS= read -r _; do
+        while IFS= read -r -t 0.3 _; do :; done   # coalesce a burst (multi-write saves,
+        scan_and_dispatch                         # and strip_markers' own writes) into one
+    done                                          # rescan, so markers aren't read mid-edit
 fi
